@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""On-demand exit-node check. Run on the Docker host: sudo ./exit-check
+
+Prints ONE line: UP / SLOW / DOWN + reason. Read-only, secret-free.
+  --reconnect   recreate the stack (Gluetun picks another server), then check
+Reads STACK_DIR and STACK_NAME from ./.env or the environment.
+"""
+import json, os, pathlib, re, subprocess, sys, time
+
+
+def _env(key, default):
+    if os.environ.get(key):
+        return os.environ[key]
+    for line in (pathlib.Path(__file__).resolve().parent / '.env').read_text().splitlines() if (pathlib.Path(__file__).resolve().parent / '.env').exists() else []:
+        if line.startswith(key + '='):
+            return line.split('=', 1)[1].strip()
+    return default
+
+
+STACK = _env('STACK_DIR', str(pathlib.Path(__file__).resolve().parent))
+NAME = _env('STACK_NAME', 'vpn-exit')
+VPN, TS, FIX = f'{NAME}-vpn', f'{NAME}-tailscale', f'{NAME}-fixup'
+SLOW_MS = 1500
+
+
+def sh(args, timeout=20):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return -1, ''
+
+
+def dx(c, *a, timeout=20):
+    return sh(['docker', 'exec', c, *a], timeout)
+
+
+def egress():
+    t = time.monotonic()
+    rc, out = dx(VPN, 'wget', '-qO-', '-T', '8', 'https://api.ipify.org', timeout=12)
+    return (out.strip() if rc == 0 else ''), int((time.monotonic() - t) * 1000)
+
+
+def check():
+    for c in (VPN, TS, FIX):
+        rc, out = sh(['docker', 'inspect', '-f', '{{.State.Status}}', c])
+        if out.strip() != 'running':
+            return 'DOWN', f'{c} {out.strip() or "missing"}', 'sudo ./exit-check --reconnect'
+    if dx(VPN, 'ip', 'link', 'show', 'tun0')[0] != 0:
+        return 'DOWN', 'VPN tunnel not connected', 'sudo ./exit-check --reconnect'
+    ip, ms = egress()
+    if not ip:
+        return 'DOWN', 'no internet through the VPN', 'sudo ./exit-check --reconnect'
+    rc, out = dx(TS, 'tailscale', 'status', '--json')
+    try:
+        st = json.loads(out)
+    except ValueError:
+        return 'DOWN', 'tailscale not answering', 'sudo ./exit-check --reconnect'
+    if st.get('BackendState') != 'Running':
+        return 'DOWN', f'tailscale {st.get("BackendState")}', 'sudo ./exit-check --reconnect'
+    _, rules = dx(VPN, 'ip', 'rule', 'show')
+    if 'iif tailscale0 lookup 51820' not in rules:
+        return 'DOWN', 'exit routing missing (fixup)', f'sudo docker restart {FIX}'
+    _, rt = dx(VPN, 'ip', 'route', 'get', '1.1.1.1', 'mark', '0x80000')
+    if ' dev eth0 ' not in rt:
+        return 'SLOW', 'tailscale underlay routed into the VPN (fixup rule missing)', f'sudo docker restart {FIX}'
+    relayed = [(p.get('HostName'), p.get('Relay')) for p in (st.get('Peer') or {}).values()
+               if p.get('Active') and not p.get('CurAddr') and p.get('Relay')]
+    if relayed:
+        who = ', '.join(f'{h} via {r}' for h, r in relayed)
+        return 'SLOW', f'relayed: {who}', 'usually network-side (mobile CGNAT); retry on Wi-Fi'
+    if ms > SLOW_MS:
+        return 'SLOW', f'VPN server slow ({ms}ms)', 'sudo ./exit-check --reconnect'
+    peers = sum(1 for p in (st.get('Peer') or {}).values() if p.get('Active') and p.get('CurAddr'))
+    return 'UP', f'{ms}ms via VPN {ip}, {peers} active device(s) direct', ''
+
+
+def main():
+    if '--reconnect' in sys.argv:
+        print('reconnecting (new server)...', flush=True)
+        sh(['docker', 'compose', '-p', NAME, '--project-directory', STACK,
+            'up', '-d', '--force-recreate', 'vpn', 'tailscale', 'fixup'], timeout=240)
+        for _ in range(18):
+            time.sleep(10)
+            if check()[0] == 'UP':
+                break
+    state, why, fix = check()
+    print(f'{state}: {why}' + (f'  ->  {fix}' if fix else ''))
+    sys.exit(0 if state == 'UP' else 1)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,132 @@
+# Tailscale exit node that egresses through a commercial VPN (Gluetun).
+#
+# Four services, one network namespace:
+#   vpn       Gluetun: WireGuard tunnel to your provider + firewall
+#   tailscale advertises this box as an exit node (shares vpn's netns)
+#   fixup     reapplies the routing/firewall rules Gluetun wipes on reconnect
+#   updater   nightly pull + verify + rollback (see update.sh)
+#
+# All site-specific values live in .env (copy .env.example). Never commit .env.
+# Images use floating tags on purpose; the updater keeps them current and
+# rolls back if a new image fails verification.
+
+services:
+  vpn:
+    image: qmcgaw/gluetun:v3
+    container_name: ${STACK_NAME:-vpn-exit}-vpn
+    restart: unless-stopped
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./gluetun:/gluetun
+      - ./apply-exit-fix.sh:/apply-exit-fix.sh:ro
+    # Fixed MAC so a DHCP reservation on your router holds across recreates.
+    mac_address: ${EXIT_MAC:?set in .env}
+    networks:
+      lan:
+        ipv4_address: ${EXIT_LAN_IP:?set in .env}
+    environment:
+      # Gluetun's built-in server list for your provider; picks a server in
+      # SERVER_COUNTRIES and can move to another on reconnect.
+      # Providers: https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers
+      VPN_SERVICE_PROVIDER: ${VPN_SERVICE_PROVIDER:?set in .env}
+      VPN_TYPE: wireguard
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES:?set in .env}
+      WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY:?set in .env}
+      WIREGUARD_ADDRESSES: ${WIREGUARD_ADDRESSES:-10.2.0.2/32}
+      TZ: ${TZ:-UTC}
+      # Let Tailscale's CGNAT range through Gluetun's firewall; open the
+      # Tailscale UDP port so peers can connect directly.
+      FIREWALL_OUTBOUND_SUBNETS: 100.64.0.0/10
+      FIREWALL_INPUT_PORTS: "41641"
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+      # IPv6 off inside the namespace: avoids a v6 path that bypasses the rules.
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: ${STACK_NAME:-vpn-exit}-tailscale
+    restart: unless-stopped
+    network_mode: service:vpn
+    depends_on:
+      vpn:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./tailscale-state:/var/lib/tailscale
+    environment:
+      TS_HOSTNAME: ${TS_HOSTNAME:-vpn-exit}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+      TS_AUTH_ONCE: "true"
+      # netfilter-mode=off: Gluetun owns iptables; the fixup adds what we need.
+      TS_EXTRA_ARGS: --advertise-exit-node --accept-dns=false --netfilter-mode=off
+      TS_NO_LOGS_NO_SUPPORT: "true"
+
+  # Same image as vpn so `ip` understands table 51820 and iptables-legacy
+  # exists (Gluetun uses the legacy backend). Does not start a VPN.
+  fixup:
+    image: qmcgaw/gluetun:v3
+    container_name: ${STACK_NAME:-vpn-exit}-fixup
+    restart: unless-stopped
+    network_mode: service:vpn
+    depends_on:
+      - tailscale
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./apply-exit-fix.sh:/apply-exit-fix.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "fixup started"
+        while true; do
+          /bin/sh /apply-exit-fix.sh || true
+          sleep 5
+        done
+
+  # Nightly pull + verify + rollback. Lives in the stack rather than host cron
+  # so an OS update can't quietly remove it. Writes a secret-free status JSON.
+  updater:
+    image: docker:29-cli
+    container_name: ${STACK_NAME:-vpn-exit}-updater
+    restart: unless-stopped
+    environment:
+      TZ: ${UPDATER_TZ:-UTC}           # POSIX TZ string; the image has no tzdata
+      RUN_HOUR: ${UPDATER_RUN_HOUR:-4}
+      STACK_DIR: ${STACK_DIR:?set in .env}
+      STATUS_DIR: /status
+      PROJECT: ${STACK_NAME:-vpn-exit}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${STACK_DIR:?set in .env}:${STACK_DIR:?set in .env}
+      - ${STATUS_DIR:?set in .env}:/status
+    entrypoint: ["/bin/sh", "${STACK_DIR}/update.sh"]
+    command: ["loop"]
+
+# Own LAN address via macvlan. On Docker's default bridge the only addresses
+# Tailscale can advertise are an internal 172.x one and your public IP, so
+# devices at home end up on a relay. With macvlan the node advertises a real
+# LAN address and peers connect directly. The host itself cannot reach a
+# macvlan container; nothing here needs it to.
+networks:
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: ${EXIT_PARENT_IF:?set in .env}
+    ipam:
+      config:
+        - subnet: ${EXIT_LAN_SUBNET:?set in .env}
+          gateway: ${EXIT_LAN_GATEWAY:?set in .env}
