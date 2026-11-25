@@ -8,7 +8,7 @@ Why: phones run one VPN at a time, so Tailscale and a privacy VPN fight over the
 phone ──Tailscale (direct, WireGuard)──▶ this box ──Gluetun / WireGuard──▶ VPN provider ──▶ internet
 ```
 
-Companion write-up: *Tailscale and Proton VPN at the same time* on [aether.noir.box](https://aether.noir.box) (link added when published).
+Companion write-up: [How to run Tailscale and Proton VPN at the same time](https://aether.noir.box/blog/tailscale-proton-vpn-exit-node/).
 
 ## What you need
 
